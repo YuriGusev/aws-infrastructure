@@ -1,56 +1,66 @@
 /*
- * Create S3 bucket with appropriate permissions
+ * Origin for Cloud Front to access s3 bucket
  */
-data "template_file" "bucket_policy" {
-  template = file("${path.module}/bucket-policy.json")
-
-  vars = {
-    bucket_name         = var.bucket_name
-    deployment_user_arn = var.deployment_user_arn
-  }
-}
-
-resource "aws_s3_bucket" "hugo" {
-  bucket        = var.bucket_name
-  acl           = "public-read"
-  policy        = data.template_file.bucket_policy.rendered
-  force_destroy = true
-
-  website {
-    index_document = "index.html"
-    error_document = "${var.origin_path}/404.html"
-
-    // Routing rule is needed to support hugo friendly urls
-    routing_rules = var.routing_rules
-  }
-
-  cors_rule {
-    allowed_headers = var.cors_allowed_headers
-    allowed_methods = var.cors_allowed_methods
-    allowed_origins = var.cors_allowed_origins
-    expose_headers  = var.cors_expose_headers
-    max_age_seconds = var.cors_max_age_seconds
-  }
+resource "aws_cloudfront_origin_access_identity" "origin_access_identity" {
+  comment = "Origin access identity to access S3 bucket"
 }
 
 /*
- * Create CloudFront distribution for SSL support but caching disabled, leave that to Cloudflare
+ * Bucket to host the web page
  */
+resource "aws_s3_bucket" "hugo" {
+  bucket        = var.bucket_name
+  force_destroy = true
+}
+
+data "aws_iam_policy_document" "s3_policy" {
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.hugo.arn}/public/*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [aws_cloudfront_origin_access_identity.origin_access_identity.iam_arn]
+    }
+  }
+
+  statement {
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.hugo.arn]
+
+    principals {
+      type        = "AWS"
+      identifiers = [aws_cloudfront_origin_access_identity.origin_access_identity.iam_arn]
+    }
+  }
+
+  /* Allow deployment user with write access */
+  statement {
+    actions   = ["s3:PutObject", "s3:PutObjectAcl"]
+    resources = ["${aws_s3_bucket.hugo.arn}/public/*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [var.deployment_user_arn]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "hugo_bucket_policy" {
+  bucket = aws_s3_bucket.hugo.id
+  policy = data.aws_iam_policy_document.s3_policy.json
+}
+
 resource "aws_cloudfront_distribution" "hugo" {
   count      = 1
   depends_on = [aws_s3_bucket.hugo]
 
   origin {
-    custom_origin_config {
-      http_port              = 80
-      https_port             = 443
-      origin_protocol_policy = "http-only"
-      origin_ssl_protocols   = ["SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2"]
+    s3_origin_config {
+      origin_access_identity = aws_cloudfront_origin_access_identity.origin_access_identity.cloudfront_access_identity_path
     }
 
-    // Important to use this format of origin domain name, it is the only format that
-    // supports S3 redirects with CloudFront
-    domain_name = "${var.bucket_name}.s3-website-${var.aws_region}.amazonaws.com"
+    domain_name = aws_s3_bucket.hugo.bucket_regional_domain_name
 
     origin_id   = var.s3_origin_id
     origin_path = var.origin_path
